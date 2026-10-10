@@ -7,7 +7,8 @@ Fitur utama:
   • Stream-copy (-c copy) agar pemotongan instan tanpa re-encoding.
   • Mode Re-encoding untuk pemotongan presisi tinggi.
   • Thumbnail Otomatis: Membuat cover bernomor untuk setiap part video.
-  • Memasang cover/artwork langsung ke file MP4 tanpa mengubah timeline/durasi video.
+  • Intro Thumbnail 1 Detik: Menyematkan thumbnail bernomor pada detik 0-1 di setiap potongan video (Reels/Shorts ready).
+  • Memasang cover/artwork langsung ke file MP4 tanpa mengubah total durasi video.
   • Otomatis membuat folder output di lokasi file sumber.
   • Menangani sisa durasi secara akurat.
 
@@ -83,6 +84,67 @@ def get_video_duration(filepath: str) -> float:
         raise RuntimeError(
             "Gagal membaca durasi video. Pastikan FFmpeg/FFprobe terinstal dan ada di PATH."
         ) from exc
+
+
+def get_video_resolution(filepath: str) -> tuple[int, int]:
+    """
+    Membaca resolusi (width, height) video menggunakan ffprobe,
+    memperhitungkan metadata orientasi/rotasi jika ada.
+    Mengembalikan (width, height) genap untuk kompatibilitas codec.
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        filepath,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        info = json.loads(result.stdout)
+        v_stream = next(
+            (s for s in info.get("streams", []) if s.get("codec_type") == "video"),
+            None,
+        )
+        if not v_stream:
+            return (1920, 1080)
+
+        width = int(v_stream.get("width", 1920))
+        height = int(v_stream.get("height", 1080))
+
+        # Cek apakah ada metadata rotasi (misal video rekaman smartphone)
+        rotation = 0
+        for side_data in v_stream.get("side_data_list", []):
+            if "rotation" in side_data:
+                try:
+                    rotation = abs(int(side_data["rotation"]))
+                except Exception:
+                    pass
+
+        if not rotation:
+            tags = v_stream.get("tags", {})
+            rot_tag = tags.get("rotate")
+            if rot_tag:
+                try:
+                    rotation = abs(int(rot_tag))
+                except Exception:
+                    pass
+
+        if rotation in (90, 270):
+            width, height = height, width
+
+        # Pastikan bernilai genap agar kompatibel dengan codec H.264
+        width = width if width % 2 == 0 else width + 1
+        height = height if height % 2 == 0 else height + 1
+        return (width, height)
+    except Exception:
+        return (1920, 1080)
 
 
 # ──────────────────────────────────────────────
@@ -290,12 +352,14 @@ def split_video(
     thumbnail_path: str = "",
     thumb_position: str = "bottom_right",
     save_thumb_files: bool = False,
+    overlay_intro: bool = True,
     log_callback=None,
     done_callback=None,
 ):
     """
-    Memotong video menjadi beberapa bagian dengan durasi tertentu dan
-    memasang thumbnail cover otomatis jika disediakan.
+    Memotong video menjadi beberapa bagian dengan durasi tertentu,
+    menampilkan gambar thumbnail bernomor pada 1 detik pertama tiap potongan (opsional),
+    dan memasang thumbnail cover otomatis sebagai metadata MP4 jika disediakan.
 
     Args:
         filepath:         Path lengkap ke file video sumber.
@@ -304,6 +368,7 @@ def split_video(
         thumbnail_path:   Path ke gambar thumbnail utama (opsional).
         thumb_position:   Posisi nomor pada thumbnail.
         save_thumb_files: Apakah file gambar thumbnail (.jpg) juga disimpan di folder output.
+        overlay_intro:    Tampilkan thumbnail pada detik 0-1 di setiap potongan video.
         log_callback:     Fungsi untuk menulis log ke GUI (opsional).
         done_callback:    Fungsi yang dipanggil setelah proses selesai.
     """
@@ -316,30 +381,40 @@ def split_video(
                 pass
 
     try:
-        # ── 1. Baca durasi total ────────────────────
+        # ── 1. Baca durasi & resolusi video ───────────
         total_seconds = get_video_duration(filepath)
+        video_w, video_h = get_video_resolution(filepath)
         segment_seconds = segment_minutes * 60
         total_parts = math.ceil(total_seconds / segment_seconds)
 
         total_fmt = str(timedelta(seconds=int(total_seconds)))
         log("=" * 50)
         log(f"📁 File Video : {os.path.basename(filepath)}")
+        log(f"📐 Resolusi   : {video_w}x{video_h} px")
         log(f"⏱  Durasi     : {total_fmt}  ({total_seconds:.1f} detik)")
         log(f"✂  Split      : setiap {segment_minutes} menit → {total_parts} bagian")
-        log(f"⚙  Metode     : {'Instan (Stream Copy)' if mode == 'copy' else 'Presisi (Re-encoding)'}")
 
         has_thumbnail = bool(thumbnail_path and os.path.isfile(thumbnail_path))
+        use_intro = has_thumbnail and overlay_intro
+
         if has_thumbnail:
             log(f"🖼  Thumbnail  : {os.path.basename(thumbnail_path)} (Posisi: {thumb_position})")
+            log(f"🎬 Intro 1 Detik: {'Aktif (Detik 0-1 ditimpa thumbnail bernomor)' if use_intro else 'Nonaktif'}")
             log(f"💾 Simpan JPG : {'Ya' if save_thumb_files else 'Hanya Cover MP4'}")
         else:
             log("🖼  Thumbnail  : (Tidak ada thumbnail yang dipilih)")
+
+        effective_mode = "encode" if use_intro else mode
+        if use_intro and mode == "copy":
+            log("⚙  Metode     : Presisi (Re-encoding) — diperlukan untuk memasang thumbnail pada 1 detik pertama")
+        else:
+            log(f"⚙  Metode     : {'Instan (Stream Copy)' if effective_mode == 'copy' else 'Presisi (Re-encoding)'}")
         log("=" * 50 + "\n")
 
         # ── 2. Buat folder output ───────────────────
         src_dir  = os.path.dirname(filepath)
-        src_name = Path(filepath).stem          # nama tanpa ekstensi
-        ext      = Path(filepath).suffix if mode == "copy" else ".mp4"  # MP4 jika re-encode
+        src_name = Path(filepath).stem
+        ext      = ".mp4" if (use_intro or mode == "encode") else Path(filepath).suffix
         out_dir  = os.path.join(src_dir, f"{src_name}_Splits")
         os.makedirs(out_dir, exist_ok=True)
         log(f"📂 Folder output: {out_dir}\n")
@@ -358,83 +433,114 @@ def split_video(
             dur_fmt   = str(timedelta(seconds=int(duration)))
             log(f"🔄 Memotong Part {part_num}/{total_parts} [{start_fmt} → +{dur_fmt}] ...")
 
-            if mode == "encode":
-                cmd = [
-                    "ffmpeg",
-                    "-y",                       # overwrite tanpa konfirmasi
-                    "-ss", str(start_sec),      # posisi awal
-                    "-i", filepath,             # input file
-                    "-t", str(duration),        # durasi potongan
-                    "-c:v", "libx264",          # video codec H.264
-                    "-preset", "veryfast",      # preset encoding cepat
-                    "-crf", "22",               # visual quality
-                    "-c:a", "aac",              # audio codec AAC
-                    "-avoid_negative_ts", "make_zero",
-                    out_file,
-                ]
-            else:
-                cmd = [
-                    "ffmpeg",
-                    "-y",                       # overwrite tanpa konfirmasi
-                    "-ss", str(start_sec),      # posisi awal
-                    "-i", filepath,             # input file
-                    "-t", str(duration),        # durasi potongan
-                    "-c", "copy",               # STREAM COPY — tanpa re-encoding
-                    "-avoid_negative_ts", "make_zero",
-                    out_file,
-                ]
+            temp_thumb_path = ""
+            thumb_file_dest = ""
 
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
-
-            if proc.returncode != 0:
-                log(f"⚠  Peringatan pada Part {part_num}: {proc.stderr[-200:]}")
-            else:
-                log(f"   ✓ File video Part {part_num} berhasil dibuat")
-
-            # ── 4. Pasang Thumbnail Otomatis ───────────
-            if has_thumbnail and os.path.isfile(out_file):
-                temp_thumb_path = ""
+            # Buat gambar thumbnail bernomor terlebih dahulu jika ada
+            if has_thumbnail:
                 try:
-                    # Tentukan lokasi file gambar thumbnail
                     if save_thumb_files:
                         thumb_file_dest = os.path.join(out_dir, f"{src_name}_Part_{part_num}_thumb.jpg")
                     else:
-                        # Buat di folder temp jika tidak ingin disimpan permanen
                         fd, thumb_file_dest = tempfile.mkstemp(suffix=f"_thumb_{part_num}.jpg")
                         os.close(fd)
                         temp_thumb_path = thumb_file_dest
 
-                    # Buat thumbnail bernomor
                     create_numbered_thumbnail(
                         image_path=thumbnail_path,
                         number=part_num,
                         output_path=thumb_file_dest,
                         position=thumb_position,
                     )
+                except Exception as t_err:
+                    log(f"   ⚠ Gagal membuat thumbnail nomor Part {part_num}: {t_err}")
+                    thumb_file_dest = ""
 
-                    # Pasang sebagai cover/artwork ke video
+            # Eksekusi pemotongan video (dengan overlay thumbnail pada detik 0-1 jika aktif)
+            try:
+                if use_intro and thumb_file_dest and os.path.isfile(thumb_file_dest):
+                    intro_dur = min(1.0, duration)
+                    filter_str = (
+                        f"[1:v]scale={video_w}:{video_h}:force_original_aspect_ratio=decrease,"
+                        f"pad={video_w}:{video_h}:-1:-1:black,format=yuv420p[ov];"
+                        f"[0:v][ov]overlay=0:0:enable='between(t,0,{intro_dur:.3f})'[v]"
+                    )
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-ss", str(start_sec),
+                        "-t", str(duration),
+                        "-i", filepath,
+                        "-loop", "1",
+                        "-t", str(intro_dur),
+                        "-i", thumb_file_dest,
+                        "-filter_complex", filter_str,
+                        "-map", "[v]",
+                        "-map", "0:a?",
+                        "-c:v", "libx264",
+                        "-preset", "veryfast",
+                        "-crf", "22",
+                        "-c:a", "aac",
+                        "-avoid_negative_ts", "make_zero",
+                        out_file,
+                    ]
+                elif effective_mode == "encode":
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-ss", str(start_sec),
+                        "-t", str(duration),
+                        "-i", filepath,
+                        "-c:v", "libx264",
+                        "-preset", "veryfast",
+                        "-crf", "22",
+                        "-c:a", "aac",
+                        "-avoid_negative_ts", "make_zero",
+                        out_file,
+                    ]
+                else:
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-ss", str(start_sec),
+                        "-t", str(duration),
+                        "-i", filepath,
+                        "-c", "copy",
+                        "-avoid_negative_ts", "make_zero",
+                        out_file,
+                    ]
+
+                proc = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+
+                if proc.returncode != 0:
+                    log(f"⚠  Peringatan pada Part {part_num}: {proc.stderr[-250:]}")
+                else:
+                    if use_intro:
+                        log(f"   ✓ Video Part {part_num} dibuat + thumbnail 1 detik pertama terpasang")
+                    else:
+                        log(f"   ✓ File video Part {part_num} berhasil dibuat")
+
+                # Pasang cover/artwork metadata ke file MP4
+                if has_thumbnail and thumb_file_dest and os.path.isfile(out_file):
                     success = attach_thumbnail_to_video(out_file, thumb_file_dest)
                     if success:
-                        log(f"   🖼 Cover Part {part_num} terpasang (Nomor #{part_num})")
+                        log(f"   🖼 Cover MP4 Part {part_num} terpasang (Nomor #{part_num})")
                     else:
-                        log(f"   ⚠ Gagal memasang cover pada Part {part_num} (Video tetap aman)")
+                        log(f"   ⚠ Gagal memasang cover metadata pada Part {part_num}")
 
-                except Exception as thumb_err:
-                    log(f"   ⚠ Gagal memproses thumbnail Part {part_num}: {thumb_err}")
-
-                finally:
-                    # Bersihkan file temp jika ada
-                    if temp_thumb_path and os.path.exists(temp_thumb_path):
-                        try:
-                            os.remove(temp_thumb_path)
-                        except Exception:
-                            pass
+            finally:
+                # Bersihkan file temp jika ada
+                if temp_thumb_path and os.path.exists(temp_thumb_path):
+                    try:
+                        os.remove(temp_thumb_path)
+                    except Exception:
+                        pass
 
             log(f"✅ Part {part_num} selesai → {os.path.basename(out_file)}\n")
 
@@ -472,8 +578,8 @@ class AutoVideoSplitter(ctk.CTk):
         super().__init__()
 
         # ── Properti jendela ─────────────────────
-        self.title("Auto Video Splitter — Auto Cover Thumbnail")
-        self.geometry("740x900")
+        self.title("Auto Video Splitter — Auto Cover & 1s Intro Thumbnail")
+        self.geometry("740x920")
         self.minsize(660, 780)
         self.configure(fg_color=COLOR_BG_DARK)
 
@@ -514,7 +620,7 @@ class AutoVideoSplitter(ctk.CTk):
 
         ctk.CTkLabel(
             header_frame,
-            text="v2.0 (Auto Thumbnail)",
+            text="v2.1 (Thumbnail + 1s Intro)",
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLOR_ACCENT,
         ).pack(side="left", padx=(10, 0), pady=(6, 0))
@@ -522,7 +628,7 @@ class AutoVideoSplitter(ctk.CTk):
         # ── Deskripsi singkat ────────────────────
         ctk.CTkLabel(
             self.scroll_container,
-            text="Potong video menjadi beberapa bagian otomatis & pasang thumbnail bernomor sebagai cover video.",
+            text="Potong video otomatis, pasang cover MP4, dan sematkan thumbnail bernomor pada 1 detik pertama tiap potongan.",
             font=ctk.CTkFont(size=12),
             text_color=COLOR_TEXT_DIM,
             anchor="w",
@@ -619,9 +725,9 @@ class AutoVideoSplitter(ctk.CTk):
         sep_thumb = ctk.CTkFrame(card_thumb, height=1, fg_color=COLOR_BORDER)
         sep_thumb.pack(fill="x", pady=(4, 10))
 
-        # Baris opsi posisi nomor & penyimpanan
+        # Baris opsi posisi nomor & intro 1 detik
         opt_thumb_row = ctk.CTkFrame(card_thumb, fg_color="transparent")
-        opt_thumb_row.pack(fill="x")
+        opt_thumb_row.pack(fill="x", pady=(0, 8))
 
         ctk.CTkLabel(
             opt_thumb_row,
@@ -644,11 +750,28 @@ class AutoVideoSplitter(ctk.CTk):
             button_hover_color=COLOR_ACCENT_HVR,
             dropdown_fg_color=COLOR_BG_CARD,
         )
-        self.combo_position.pack(side="left", padx=(0, 20))
+        self.combo_position.pack(side="left", padx=(0, 16))
+
+        self._overlay_intro_var = tk.BooleanVar(value=True)
+        self.chk_overlay_intro = ctk.CTkCheckBox(
+            opt_thumb_row,
+            text="Sematkan di 1 detik pertama video (Reels/Shorts)",
+            variable=self._overlay_intro_var,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=COLOR_TEXT,
+            fg_color=COLOR_ACCENT,
+            hover_color=COLOR_ACCENT_HVR,
+            border_color=COLOR_BORDER,
+        )
+        self.chk_overlay_intro.pack(side="left")
+
+        # Baris opsi penyimpanan & info
+        opt_thumb_row2 = ctk.CTkFrame(card_thumb, fg_color="transparent")
+        opt_thumb_row2.pack(fill="x")
 
         self._save_thumb_var = tk.BooleanVar(value=False)
         self.chk_save_thumb = ctk.CTkCheckBox(
-            opt_thumb_row,
+            opt_thumb_row2,
             text="Simpan file .jpg di folder output",
             variable=self._save_thumb_var,
             font=ctk.CTkFont(size=12),
@@ -657,7 +780,16 @@ class AutoVideoSplitter(ctk.CTk):
             hover_color=COLOR_ACCENT_HVR,
             border_color=COLOR_BORDER,
         )
-        self.chk_save_thumb.pack(side="left")
+        self.chk_save_thumb.pack(side="left", padx=(0, 16))
+
+        self.lbl_thumb_hint = ctk.CTkLabel(
+            opt_thumb_row2,
+            text="💡 Thumbnail nomor muncul di detik 0-1, audio video asli tetap berjalan normal.",
+            font=ctk.CTkFont(size=11, slant="italic"),
+            text_color=COLOR_TEXT_DIM,
+            anchor="w",
+        )
+        self.lbl_thumb_hint.pack(side="left")
 
         # ══════════════════════════════════════════
         # CARD 3 — Durasi Split
@@ -764,7 +896,7 @@ class AutoVideoSplitter(ctk.CTk):
 
         self.lbl_mode_desc = ctk.CTkLabel(
             card_mode,
-            text="💡 Stream Copy memotong instan tanpa render ulang. Cover dipasang langsung sebagai artwork MP4.",
+            text="💡 Stream Copy memotong instan tanpa render ulang. Jika thumbnail 1 detik pertama aktif, video otomatis di-encode presisi.",
             font=ctk.CTkFont(size=11, slant="italic"),
             text_color=COLOR_TEXT_DIM,
             anchor="w",
@@ -820,7 +952,7 @@ class AutoVideoSplitter(ctk.CTk):
         # ── Footer ──────────────────────────────
         ctk.CTkLabel(
             self.scroll_container,
-            text="Menggunakan FFmpeg & Pillow • Cover MP4 tidak mengubah timeline video",
+            text="Menggunakan FFmpeg & Pillow • Dukungan cover MP4 & overlay intro 1 detik",
             font=ctk.CTkFont(size=11),
             text_color=COLOR_TEXT_DIM,
         ).pack(pady=(4, 0))
@@ -986,6 +1118,7 @@ class AutoVideoSplitter(ctk.CTk):
         mode = self._mode_var.get()
         thumb_pos = self.POSITION_MAP.get(self._position_var.get(), "bottom_right")
         save_thumbs = self._save_thumb_var.get()
+        overlay_intro = self._overlay_intro_var.get()
 
         # Bersihkan log
         self.txt_log.configure(state="normal")
@@ -1011,6 +1144,7 @@ class AutoVideoSplitter(ctk.CTk):
                 "thumbnail_path": self._selected_thumbnail,
                 "thumb_position": thumb_pos,
                 "save_thumb_files": save_thumbs,
+                "overlay_intro": overlay_intro,
                 "log_callback": self._log,
                 "done_callback": self._on_done,
             },
